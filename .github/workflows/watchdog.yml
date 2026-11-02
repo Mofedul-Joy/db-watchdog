@@ -1,0 +1,46 @@
+name: db-watchdog
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  actions: read
+concurrency: watchdog
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      REF: ${{ secrets.PROJECT_REF }}
+      ANON: ${{ secrets.ANON_KEY }}
+      MGMT: ${{ secrets.MGMT_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Probe auth (a login lookup hits the database)
+        id: probe
+        run: |
+          fails=0
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -m 20 -w "%{http_code}" -X POST "https://$REF.supabase.co/auth/v1/token?grant_type=password" \
+              -H "apikey: $ANON" -H "Content-Type: application/json" -d '{"email":"watchdog-probe@invalid.example","password":"x"}' || true)
+            echo "try $i: $code"
+            if [ "$code" = "400" ] || [ "$code" = "200" ]; then echo "healthy=1" >> $GITHUB_OUTPUT; exit 0; fi
+            fails=$((fails+1)); sleep 30
+          done
+          echo "healthy=0" >> $GITHUB_OUTPUT
+      - name: Restart if frozen (max once per 30 min)
+        if: steps.probe.outputs.healthy == '0'
+        run: |
+          status=$(curl -s -m 20 "https://api.supabase.com/v1/projects/$REF" -H "Authorization: Bearer $MGMT" | jq -r .status)
+          echo "project status: $status"
+          if [ "$status" != "ACTIVE_HEALTHY" ]; then echo "not healthy-idle ($status), skip restart"; exit 1; fi
+          recent=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=restarted&per_page=5" --jq "[.artifacts[] | select((now - (.created_at|fromdateiso8601)) < 1800)] | length")
+          if [ "$recent" != "0" ]; then echo "restarted <30 min ago, skip"; exit 1; fi
+          curl -s -f -m 60 -X POST "https://api.supabase.com/v1/projects/$REF/restart" -H "Authorization: Bearer $MGMT"
+          date -u > restarted.txt
+      - uses: actions/upload-artifact@v4
+        if: steps.probe.outputs.healthy == '0' && hashFiles('restarted.txt') != ''
+        with: { name: restarted, path: restarted.txt, retention-days: 1 }
+      - name: Fail so GitHub emails an alert
+        if: steps.probe.outputs.healthy == '0'
+        run: echo "DB was frozen; restart sent" && exit 1
